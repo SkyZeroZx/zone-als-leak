@@ -1,0 +1,13 @@
+{
+  "name": "zone-als-leak",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Angular SSR with zone.js: AsyncLocalStorage returns another request's store.",
+  "scripts": {
+    "mechanism": "node tools/mechanism.mjs"
+  },
+  "dependencies": {
+    "zone.js": "0.16.3"
+  }
+}

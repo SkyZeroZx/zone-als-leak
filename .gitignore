@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.angular/
+*.log
+out/
+.node/
+
+# local notes and the old probe harness
+zone_als.md
+NOTES-internal.md
+app/hunt/
