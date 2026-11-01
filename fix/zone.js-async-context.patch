@@ -1,0 +1,685 @@
+diff --git a/lib/common/promise.ts b/lib/common/promise.ts
+index 26df70719ae..abab3434b5c 100644
+--- a/lib/common/promise.ts
++++ b/lib/common/promise.ts
+@@ -5,7 +5,7 @@
+  * Use of this source code is governed by an MIT-style license that can be
+  * found in the LICENSE file at https://angular.dev/license
+  */
+-import {ZoneType} from '../zone-impl';
++import {AsyncContextRunner, ZoneType} from '../zone-impl';
+ 
+ import {patchMethod} from './utils';
+ 
+@@ -55,15 +55,26 @@ export function patchPromise(Zone: ZoneType): void {
+     api.microtaskDrainDone = () => {
+       while (_uncaughtPromiseErrors.length) {
+         const uncaughtPromiseError: UncaughtPromiseError = _uncaughtPromiseErrors.shift()!;
+-        try {
+-          uncaughtPromiseError.zone.runGuarded(() => {
+-            if (uncaughtPromiseError.throwOriginal) {
+-              throw uncaughtPromiseError.rejection;
+-            }
+-            throw uncaughtPromiseError;
+-          });
+-        } catch (error) {
+-          handleUnhandledRejection(error);
++        const report = () => {
++          try {
++            uncaughtPromiseError.zone.runGuarded(() => {
++              if (uncaughtPromiseError.throwOriginal) {
++                throw uncaughtPromiseError.rejection;
++              }
++              throw uncaughtPromiseError;
++            });
++          } catch (error) {
++            handleUnhandledRejection(error);
++          }
++        };
++        // This runs after the microtask queue has been drained, so the host is no longer in the
++        // async context of the operation whose promise was rejected. Restore the one captured
++        // where the rejection happened, which is where the host would report it.
++        const asyncContext = uncaughtPromiseError.asyncContext;
++        if (asyncContext) {
++          asyncContext(report);
++        } else {
++          report();
+         }
+       }
+     };
+@@ -213,7 +224,14 @@ export function patchPromise(Zone: ZoneType): void {
+           }
+ 
+           for (let i = 0; i < queue.length;) {
+-            scheduleResolveOrReject(promise, queue[i++], queue[i++], queue[i++], queue[i++]);
++            scheduleResolveOrReject(
++              promise,
++              queue[i++],
++              queue[i++],
++              queue[i++],
++              queue[i++],
++              queue[i++],
++            );
+           }
+           if (queue.length == 0 && state == REJECTED) {
+             (promise as any)[symbolState] = REJECTED_NO_CATCH;
+@@ -239,6 +257,11 @@ export function patchPromise(Zone: ZoneType): void {
+             uncaughtPromiseError.promise = promise;
+             uncaughtPromiseError.zone = Zone.current;
+             uncaughtPromiseError.task = Zone.currentTask!;
++            // The host attributes an unhandled rejection to the context the promise was created
++            // in. This uses the one it was rejected in, which only differs for a promise shared
++            // between operations; capturing at construction would cost an async resource for
++            // every promise.
++            uncaughtPromiseError.asyncContext = api.captureAsyncContext();
+             _uncaughtPromiseErrors.push(uncaughtPromiseError);
+             api.scheduleMicroTask(); // to make sure that it is running
+           }
+@@ -277,6 +300,7 @@ export function patchPromise(Zone: ZoneType): void {
+       chainPromise: ZoneAwarePromise<any>,
+       onFulfilled?: ((value: R) => U1) | null | undefined,
+       onRejected?: ((error: any) => U2) | null | undefined,
++      asyncContext?: AsyncContextRunner | null,
+     ): void {
+       clearRejectedNoCatch(promise);
+       const promiseState = (promise as any)[symbolState];
+@@ -314,6 +338,8 @@ export function patchPromise(Zone: ZoneType): void {
+           }
+         },
+         chainPromise as TaskData,
++        undefined,
++        asyncContext,
+       );
+     }
+ 
+@@ -543,10 +569,27 @@ export function patchPromise(Zone: ZoneType): void {
+         }
+         const chainPromise: Promise<TResult1 | TResult2> = new (C as typeof ZoneAwarePromise)(noop);
+         const zone = Zone.current;
++        // The host runs a reaction in the async context in which it was registered, not in the one
++        // in which the promise happened to settle. Capture it here, because the reactions of every
++        // promise in the process are run from a shared microtask queue.
++        const asyncContext = api.captureAsyncContext();
+         if ((this as any)[symbolState] == UNRESOLVED) {
+-          (<any[]>(this as any)[symbolValue]).push(zone, chainPromise, onFulfilled, onRejected);
++          (<any[]>(this as any)[symbolValue]).push(
++            zone,
++            chainPromise,
++            onFulfilled,
++            onRejected,
++            asyncContext,
++          );
+         } else {
+-          scheduleResolveOrReject(this, zone, chainPromise as any, onFulfilled, onRejected);
++          scheduleResolveOrReject(
++            this,
++            zone,
++            chainPromise as any,
++            onFulfilled,
++            onRejected,
++            asyncContext,
++          );
+         }
+         return chainPromise;
+       }
+@@ -566,10 +609,25 @@ export function patchPromise(Zone: ZoneType): void {
+         const chainPromise: Promise<R | never> = new (C as typeof ZoneAwarePromise)(noop);
+         (chainPromise as any)[symbolFinally] = symbolFinally;
+         const zone = Zone.current;
++        // See the comment on the call to `captureAsyncContext` in `then`.
++        const asyncContext = api.captureAsyncContext();
+         if ((this as any)[symbolState] == UNRESOLVED) {
+-          (<any[]>(this as any)[symbolValue]).push(zone, chainPromise, onFinally, onFinally);
++          (<any[]>(this as any)[symbolValue]).push(
++            zone,
++            chainPromise,
++            onFinally,
++            onFinally,
++            asyncContext,
++          );
+         } else {
+-          scheduleResolveOrReject(this, zone, chainPromise as any, onFinally, onFinally);
++          scheduleResolveOrReject(
++            this,
++            zone,
++            chainPromise as any,
++            onFinally,
++            onFinally,
++            asyncContext,
++          );
+         }
+         return chainPromise;
+       }
+diff --git a/lib/common/queue-microtask.ts b/lib/common/queue-microtask.ts
+index b5f5ce37c9a..5ab359d790e 100644
+--- a/lib/common/queue-microtask.ts
++++ b/lib/common/queue-microtask.ts
+@@ -13,7 +13,15 @@
+ export function patchQueueMicrotask(global: any, api: _ZonePrivate) {
+   api.patchMethod(global, 'queueMicrotask', (delegate) => {
+     return function (self: any, args: any[]) {
+-      Zone.current.scheduleMicroTask('queueMicrotask', args[0]);
++      // Microtasks of the whole process are drained from a single native microtask; capture the
++      // async context of this call so that the host still runs the callback in it.
++      Zone.current.scheduleMicroTask(
++        'queueMicrotask',
++        args[0],
++        undefined,
++        undefined,
++        api.captureAsyncContext(),
++      );
+     };
+   });
+ }
+diff --git a/lib/extra/bluebird.ts b/lib/extra/bluebird.ts
+index 2dad83745ac..51bc72ff47e 100644
+--- a/lib/extra/bluebird.ts
++++ b/lib/extra/bluebird.ts
+@@ -31,14 +31,23 @@ export function patchBluebird(Zone: ZoneType): void {
+                 args[i] = function () {
+                   const argSelf: any = this;
+                   const argArgs: any = arguments;
++                  // Bluebird runs this callback in the async context it was registered in, which
++                  // the shared microtask queue would otherwise lose; capture it here.
++                  const asyncContext = api.captureAsyncContext();
+                   return new Bluebird((res: any, rej: any) => {
+-                    zone.scheduleMicroTask('Promise.then', () => {
+-                      try {
+-                        res(func.apply(argSelf, argArgs));
+-                      } catch (error) {
+-                        rej(error);
+-                      }
+-                    });
++                    zone.scheduleMicroTask(
++                      'Promise.then',
++                      () => {
++                        try {
++                          res(func.apply(argSelf, argArgs));
++                        } catch (error) {
++                          rej(error);
++                        }
++                      },
++                      undefined,
++                      undefined,
++                      asyncContext,
++                    );
+                   });
+                 };
+               }
+diff --git a/lib/node/async-context.ts b/lib/node/async-context.ts
+new file mode 100644
+index 00000000000..4aba4d6cca5
+--- /dev/null
++++ b/lib/node/async-context.ts
+@@ -0,0 +1,59 @@
++/**
++ * @license
++ * Copyright Google LLC All Rights Reserved.
++ *
++ * Use of this source code is governed by an MIT-style license that can be
++ * found in the LICENSE file at https://angular.dev/license
++ */
++/**
++ * @fileoverview
++ * @suppress {missingRequire}
++ */
++
++import {ZoneType} from '../zone-impl';
++
++function loadAsyncResource(): typeof import('async_hooks').AsyncResource | undefined {
++  try {
++    // `require` is unavailable when the Node bundle is loaded as an ES module. This synchronous
++    // loader works in both module formats without making the patch asynchronous.
++    const asyncHooks = globalThis.process?.getBuiltinModule?.('node:async_hooks') as
++      typeof import('async_hooks') | undefined;
++    if (asyncHooks) {
++      return asyncHooks.AsyncResource;
++    }
++    return require('async_hooks').AsyncResource;
++  } catch {
++    // `async_hooks` or a synchronous module loader is not available in every Node.js-like host.
++    return undefined;
++  }
++}
++
++/**
++ * Node.js keeps a context of its own for every asynchronous operation - the stores of the active
++ * `AsyncLocalStorage` instances and the chain of async resources - and propagates it through
++ * promise reactions and `queueMicrotask` callbacks. Loggers, tracers and request-context
++ * libraries rely on it to tell concurrent operations apart.
++ *
++ * zone.js replaces the global `Promise` and runs the reactions of unrelated operations from a
++ * single shared microtask, so Node.js can no longer propagate that context on its own: it only
++ * sees the one microtask, and runs every reaction in the context which happened to schedule it.
++ * As the `async_hooks` documentation prescribes for code which manages its own callback queues
++ * or provides a custom thenable, zone.js therefore captures the context with an `AsyncResource`
++ * and runs the callback inside it.
++ */
++export function patchAsyncContext(Zone: ZoneType): void {
++  Zone.__load_patch('asyncContext', (global: any, Zone: ZoneType, api: _ZonePrivate) => {
++    const AsyncResource = loadAsyncResource();
++    if (AsyncResource === undefined) {
++      return;
++    }
++
++    api.captureAsyncContext = () => {
++      // Creating the resource captures the current context and `runInAsyncScope` enters it again.
++      // This is cheaper than `AsyncResource.bind` and `AsyncLocalStorage.snapshot`, which define
++      // properties on a bound function for every capture.
++      const resource = new AsyncResource('ZoneMicrotask');
++      return (callback) => resource.runInAsyncScope(callback);
++    };
++  });
++}
+diff --git a/lib/node/node.ts b/lib/node/node.ts
+index fc8b76a65e0..8271331d817 100644
+--- a/lib/node/node.ts
++++ b/lib/node/node.ts
+@@ -12,6 +12,7 @@ import {patchTimer} from '../common/timers';
+ import {ArraySlice, isMix, patchMacroTask, patchMicroTask} from '../common/utils';
+ import {ZoneType} from '../zone-impl';
+ 
++import {patchAsyncContext} from './async-context';
+ import {patchEvents} from './events';
+ import {patchFs} from './fs';
+ import {patchNodeUtil} from './node_util';
+@@ -20,6 +21,7 @@ const set = 'set';
+ const clear = 'clear';
+ 
+ export function patchNode(Zone: ZoneType): void {
++  patchAsyncContext(Zone);
+   patchNodeUtil(Zone);
+   patchEvents(Zone);
+   patchFs(Zone);
+diff --git a/lib/zone-impl.ts b/lib/zone-impl.ts
+index ec76c9c5ca8..7bb7bc30ed9 100644
+--- a/lib/zone-impl.ts
++++ b/lib/zone-impl.ts
+@@ -235,12 +235,15 @@ export declare interface Zone {
+    * @param callback
+    * @param data
+    * @param customSchedule
++   * @param asyncContext The host async context the task must run in, captured where its callback
++   *   was registered. See `ZonePrivate.captureAsyncContext`.
+    */
+   scheduleMicroTask(
+     source: string,
+     callback: Function,
+     data?: TaskData,
+     customSchedule?: (task: Task) => void,
++    asyncContext?: AsyncContextRunner | null,
+   ): MicroTask;
+ 
+   /**
+@@ -382,6 +385,15 @@ export declare interface ZonePrivate {
+   attachOriginToPatched: (target: any, origin: any) => void;
+   _redefineProperty: (target: any, callback: string, desc: any) => void;
+   nativeScheduleMicroTask: (func: Function) => void;
++  /**
++   * Captures the async context of the host - for instance the `AsyncLocalStorage` stores
++   * which are active in the current Node.js execution context - so that a callback which
++   * runs later, from the shared microtask queue, can be invoked within it.
++   *
++   * Returns `null` when the host does not track an async context of its own (the browser,
++   * for example), in which case callers invoke their callback directly.
++   */
++  captureAsyncContext: () => AsyncContextRunner | null;
+   patchCallbacks: (
+     api: ZonePrivate,
+     target: any,
+@@ -406,6 +418,14 @@ export declare interface ZonePrivate {
+     | undefined;
+ }
+ 
++/**
++ * Invokes `callback` within an async context captured earlier by
++ * `ZonePrivate.captureAsyncContext` and returns its result.
++ */
++export declare interface AsyncContextRunner {
++  <T>(callback: () => T): T;
++}
++
+ /**
+  * ZoneFrame represents zone stack frame information
+  */
+@@ -420,6 +440,8 @@ export declare interface UncaughtPromiseError extends Error {
+   promise: Promise<any>;
+   rejection: any;
+   throwOriginal?: boolean;
++  /** The host async context the rejection happened in, if the host tracks one. */
++  asyncContext?: AsyncContextRunner | null;
+ }
+ 
+ /**
+@@ -1020,10 +1042,11 @@ export function initZone(): ZoneType {
+       callback: Function,
+       data?: TaskData,
+       customSchedule?: (task: Task) => void,
++      asyncContext?: AsyncContextRunner | null,
+     ): MicroTask {
+-      return this.scheduleTask(
+-        new ZoneTask(microTask, source, callback, data, customSchedule, undefined),
+-      );
++      const task = new ZoneTask(microTask, source, callback, data, customSchedule, undefined);
++      task._asyncContext = asyncContext ?? null;
++      return this.scheduleTask(task);
+     }
+ 
+     scheduleMacroTask(
+@@ -1394,6 +1417,11 @@ export function initZone(): ZoneType {
+     public runCount: number = 0;
+     _zoneDelegates: _ZoneDelegate[] | null = null;
+     _state: TaskState = 'notScheduled';
++    /**
++     * The host async context this task must run in, captured where its callback was registered.
++     * See `drainMicroTaskQueueSynchronously`.
++     */
++    _asyncContext: AsyncContextRunner | null = null;
+ 
+     constructor(
+       type: T,
+@@ -1557,10 +1585,23 @@ export function initZone(): ZoneType {
+         _microTaskQueue = [];
+ 
+         for (const task of queue) {
+-          try {
+-            task.zone.runTask(task, null, null);
+-          } catch (error) {
+-            _api.onUnhandledError(error as Error);
++          const runTask = () => {
++            try {
++              task.zone.runTask(task, null, null);
++            } catch (error) {
++              _api.onUnhandledError(error as Error);
++            }
++          };
++          // Microtasks of the whole process are drained from a single native microtask, which the
++          // host runs in the async context of whichever task was queued first. Restore the context
++          // captured where this task's callback was registered, the one the host would have run it
++          // in, so that concurrent operations neither observe each other's `AsyncLocalStorage`
++          // stores nor, through the task's hooks or its errors, report each other's work.
++          const asyncContext = (task as ZoneTask<'microTask'>)._asyncContext;
++          if (asyncContext) {
++            asyncContext(runTask);
++          } else {
++            runTask();
+           }
+         }
+       }
+@@ -1623,6 +1664,9 @@ export function initZone(): ZoneType {
+     _redefineProperty: () => noop,
+     patchCallbacks: () => noop,
+     nativeScheduleMicroTask,
++    // Hosts which keep an async context of their own (Node.js, through `async_hooks`)
++    // replace this with an implementation that captures it; see `lib/node/async-context.ts`.
++    captureAsyncContext: () => null,
+   };
+   let _currentZoneFrame: ZoneFrame = {parent: null, zone: new ZoneImpl(null, null)};
+   let _currentTask: Task | null = null;
+diff --git a/lib/zone.configurations.api.ts b/lib/zone.configurations.api.ts
+index d68589d5c4c..7952801ab25 100644
+--- a/lib/zone.configurations.api.ts
++++ b/lib/zone.configurations.api.ts
+@@ -152,6 +152,38 @@ declare global {
+      */
+     __Zone_disable_crypto?: boolean;
+ 
++    /**
++     * Disable the restoration of the `Node.js` async context in promise reactions and
++     * `queueMicrotask()` callbacks.
++     *
++     * `Node.js` keeps a context of its own for every asynchronous operation - the stores of the
++     * active `AsyncLocalStorage` instances and the chain of async resources - and propagates it
++     * through promise reactions, which is what loggers, tracers and request-context libraries use
++     * to tell concurrent operations apart.
++     *
++     * Because `zone.js` replaces the global `Promise` and runs the reactions of unrelated
++     * operations from a single shared microtask, `Node.js` cannot propagate that context on its
++     * own; by default `zone.js` captures it with an `AsyncResource` and runs the reaction inside
++     * it.
++     *
++     * Consider the following example:
++     *
++     * ```ts
++     * const {AsyncLocalStorage} = require('async_hooks');
++     *
++     * const store = new AsyncLocalStorage();
++     * store.run('first', () => Promise.resolve().then(() => console.log(store.getStore())));
++     * store.run('second', () => Promise.resolve().then(() => console.log(store.getStore())));
++     * // Both reactions run from the same microtask, and each one reads the store it was
++     * // registered in, so the output is 'first' and 'second'.
++     * ```
++     *
++     * If you set `__Zone_disable_asyncContext = true` before importing `zone.js`,
++     * `zone.js` does not capture the async context and both reactions run in the context of
++     * whichever one was registered first, so the above code outputs 'first' twice.
++     */
++    __Zone_disable_asyncContext?: boolean;
++
+     /**
+      * Disable the monkey patch of the browser `timer` APIs.
+      *
+diff --git a/test/node/async_context.spec.ts b/test/node/async_context.spec.ts
+new file mode 100644
+index 00000000000..4cebb31de41
+--- /dev/null
++++ b/test/node/async_context.spec.ts
+@@ -0,0 +1,218 @@
++/**
++ * @license
++ * Copyright Google LLC All Rights Reserved.
++ *
++ * Use of this source code is governed by an MIT-style license that can be
++ * found in the LICENSE file at https://angular.dev/license
++ */
++import {AsyncLocalStorage, executionAsyncId} from 'async_hooks';
++
++describe('Node.js async context', () => {
++  const als = new AsyncLocalStorage<string>();
++
++  /**
++   * Runs `fn` as an independent concurrent operation, as a server would run a request: in its own
++   * Zone and in its own `AsyncLocalStorage` store.
++   */
++  function asOperation(name: string, fn: () => void): void {
++    Zone.root.fork({name: `op-${name}`}).run(() => als.run(name, fn));
++  }
++
++  /** Resolves once the microtask queue and the task which drains it have run. */
++  function settled(): Promise<void> {
++    return new Promise<void>((resolve) => setTimeout(resolve, 1));
++  }
++
++  it('should run a reaction of an already resolved promise in the store it was registered in', async () => {
++    const stores: (string | undefined)[] = [];
++    const zones: string[] = [];
++
++    // Both reactions are queued in the same microtask, which the host runs in the context of
++    // whichever operation queued it first.
++    asOperation('a', () => {
++      Promise.resolve().then(() => {
++        stores.push(als.getStore());
++        zones.push(Zone.current.name);
++      });
++    });
++    asOperation('b', () => {
++      Promise.resolve().then(() => {
++        stores.push(als.getStore());
++        zones.push(Zone.current.name);
++      });
++    });
++    await settled();
++
++    expect(stores).toEqual(['a', 'b']);
++    expect(zones).toEqual(['op-a', 'op-b']);
++  });
++
++  it('should run reactions of one shared pending promise in the stores they were registered in', async () => {
++    const stores: (string | undefined)[] = [];
++    let resolveShared!: () => void;
++    const shared = new Promise<void>((resolve) => (resolveShared = resolve));
++
++    asOperation('a', () => {
++      shared.then(() => stores.push(als.getStore()));
++    });
++    asOperation('b', () => {
++      shared.then(() => stores.push(als.getStore()));
++    });
++    // The promise is settled by neither operation, as a callback of a shared connection would.
++    asOperation('c', () => resolveShared());
++    await settled();
++
++    expect(stores).toEqual(['a', 'b']);
++  });
++
++  it('should keep the store of the registering operation in a chain of reactions', async () => {
++    const stores: (string | undefined)[] = [];
++
++    for (const name of ['a', 'b']) {
++      asOperation(name, () => {
++        Promise.resolve()
++          .then(() => {})
++          .then(() => {})
++          .then(() => stores.push(als.getStore()));
++      });
++    }
++    await settled();
++
++    expect(stores).toEqual(['a', 'b']);
++  });
++
++  it('should run a `finally` callback in the store it was registered in', async () => {
++    const stores: (string | undefined)[] = [];
++
++    for (const name of ['a', 'b']) {
++      asOperation(name, () => {
++        Promise.resolve().finally(() => stores.push(als.getStore()));
++      });
++    }
++    await settled();
++
++    expect(stores).toEqual(['a', 'b']);
++  });
++
++  it('should run a rejection handler in the store it was registered in', async () => {
++    const stores: (string | undefined)[] = [];
++
++    for (const name of ['a', 'b']) {
++      asOperation(name, () => {
++        Promise.reject(new Error('nope')).catch(() => stores.push(als.getStore()));
++      });
++    }
++    await settled();
++
++    expect(stores).toEqual(['a', 'b']);
++  });
++
++  it('should run a `queueMicrotask` callback in the store it was queued in', async () => {
++    const stores: (string | undefined)[] = [];
++
++    for (const name of ['a', 'b']) {
++      asOperation(name, () => {
++        queueMicrotask(() => stores.push(als.getStore()));
++      });
++    }
++    await settled();
++
++    expect(stores).toEqual(['a', 'b']);
++  });
++
++  it('should run the task hooks of a reaction in the store it was registered in', async () => {
++    // `NgZone` tracks stability through `onHasTask` and runs change detection from it, so the
++    // hooks of a task have to run in the same store as its callback, not in the store of whichever
++    // operation queued the shared microtask.
++    const stores: (string | undefined)[] = [];
++
++    for (const name of ['a', 'b']) {
++      const zone = Zone.root.fork({
++        name: `op-${name}`,
++        onHasTask: (delegate, current, target, hasTaskState) => {
++          if (hasTaskState.change === 'microTask' && !hasTaskState.microTask) {
++            stores.push(als.getStore());
++          }
++          return delegate.hasTask(target, hasTaskState);
++        },
++      });
++      zone.run(() => als.run(name, () => Promise.resolve().then(() => {})));
++    }
++    await settled();
++
++    expect(stores).toEqual(['a', 'b']);
++  });
++
++  it('should report an error thrown by a microtask in the store it was queued in', async () => {
++    // The error leaves the task, so reporting it happens after the callback; it must still be
++    // attributed to the operation which queued the microtask.
++    const ignoreConsoleError = Zone.__symbol__('ignoreConsoleErrorUncaughtError');
++    const previous = (Zone as any)[ignoreConsoleError];
++    (Zone as any)[ignoreConsoleError] = false;
++    const stores: (string | undefined)[] = [];
++    spyOn(console, 'error').and.callFake((...args: unknown[]) => {
++      if (args.some((arg) => String((arg as Error)?.message ?? arg).includes('thrown by a task'))) {
++        stores.push(als.getStore());
++      }
++    });
++
++    for (const name of ['a', 'b']) {
++      asOperation(name, () => {
++        queueMicrotask(() => {
++          throw new Error(`thrown by a task of ${name}`);
++        });
++      });
++    }
++    await settled();
++    (Zone as any)[ignoreConsoleError] = previous;
++
++    expect(stores).toEqual(['a', 'b']);
++  });
++
++  it('should report an unhandled rejection in the store it was rejected in', async () => {
++    return await jasmine.spyOnGlobalErrorsAsync(async () => {
++      const ignoreConsoleError = Zone.__symbol__('ignoreConsoleErrorUncaughtError');
++      const previous = (Zone as any)[ignoreConsoleError];
++      (Zone as any)[ignoreConsoleError] = true;
++      const stores: (string | undefined)[] = [];
++      const listener = () => stores.push(als.getStore());
++      process.on('unhandledRejection', listener);
++
++      try {
++        for (const name of ['a', 'b']) {
++          asOperation(name, () => {
++            Promise.reject(new Error(`rejected in ${name}`));
++          });
++        }
++        await settled();
++
++        expect(stores).toEqual(['a', 'b']);
++      } finally {
++        process.removeListener('unhandledRejection', listener);
++        (Zone as any)[ignoreConsoleError] = previous;
++      }
++    });
++  });
++
++  it('should keep rejecting a `queueMicrotask` call without a callback', () => {
++    // The capture must not turn an invalid call into a microtask which fails later.
++    expect(() => (queueMicrotask as (callback?: unknown) => void)(undefined)).toThrow();
++  });
++
++  it('should restore the async resource of the registering operation', async () => {
++    // Libraries which track context through `async_hooks` rather than through
++    // `AsyncLocalStorage` rely on the reaction running in the async resource of the operation
++    // which registered it, and not in the one microtask shared by the whole process.
++    const ids: number[] = [];
++
++    for (const name of ['a', 'b']) {
++      asOperation(name, () => {
++        Promise.resolve().then(() => ids.push(executionAsyncId()));
++      });
++    }
++    await settled();
++
++    const [ranForA, ranForB] = ids;
++    expect(ranForA).not.toBe(ranForB);
++  });
++});
