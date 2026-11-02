@@ -1,0 +1,12 @@
+{
+  "name": "zone-als-leak-otel-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sentry and OpenTelemetry, each loaded with --import the way its docs show.",
+  "dependencies": {
+    "@opentelemetry/api": "1.10.0",
+    "@opentelemetry/auto-instrumentations-node": "0.82.0",
+    "@opentelemetry/sdk-node": "0.300.0",
+    "@sentry/node": "^11.10.0"
+  }
+}
